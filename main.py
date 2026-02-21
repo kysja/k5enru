@@ -1,12 +1,13 @@
+import sys
 import time
 import os
 import ctypes
 import configparser
 
-import keyboard
 import pyperclip
 import pystray
 from PIL import Image
+from pynput import keyboard as pynput_kb
 
 
 user32 = ctypes.windll.user32
@@ -18,6 +19,9 @@ SMTO_ABORTIFHUNG = 0x0002
 
 HKL_EN = "00000409"  # English (US)
 HKL_RU = "00000419"  # Russian
+
+kb = pynput_kb.Controller()
+hotkey_listener: pynput_kb.GlobalHotKeys | None = None
 
 
 # Same physical key maps to different characters depending on layout
@@ -73,12 +77,10 @@ def convert_text(text: str) -> str:
     return "".join(EN_TO_RU.get(c, c) for c in text)
 
 
-def _copy_selection() -> str:
-    """
-    Try Ctrl+C and return clipboard text.
-    Assumes clipboard is already cleared by caller for detection.
-    """
-    keyboard.send("ctrl+c")
+def copy_selection() -> str:
+    with kb.pressed(pynput_kb.Key.ctrl):
+        kb.press('c')
+        kb.release('c')
     sleep_short(0.12)
     try:
         return pyperclip.paste()
@@ -86,47 +88,13 @@ def _copy_selection() -> str:
         return ""
 
 
-def _select_previous_word_and_copy() -> str:
-    """
-    More reliable "last word":
-    - clears selection
-    - selects previous word (Ctrl+Shift+Left)
-    - copies
-    """
-    pyperclip.copy("")
-    sleep_short(0.03)
-
-    # First try selecting the previous word
-    keyboard.send("ctrl+shift+left")
-    sleep_short(0.06)
-    txt = _copy_selection()
-
-    print (f"Selected previous word: '{txt}'")  # Debugging output
-
-    # Some apps behave differently; fallback to selecting next word if needed
-    if not txt.strip():
-        keyboard.send("right")  # collapse selection/caret
-        sleep_short(0.03)
-        keyboard.send("ctrl+shift+right")
-        sleep_short(0.06)
-        txt = _copy_selection()
-
-    return txt.strip()
-
-
 def _get_foreground_hwnd() -> int:
     return user32.GetForegroundWindow()
 
 
 def _send_lang_change(hwnd: int, hkl: int) -> None:
-    """
-    Try to request language change in a way that works for more apps.
-    """
-    # Try focused control first (can be 0 for some apps)
     focused = user32.GetFocus()
     target = focused if focused else hwnd
-
-    # SendMessageTimeout reduces "hung window" issues
     user32.SendMessageTimeoutW(
         target,
         WM_INPUTLANGCHANGEREQUEST,
@@ -164,7 +132,7 @@ def on_hotkey():
         pyperclip.copy("")
         sleep_short(0.04)
 
-        selected = _copy_selection()
+        selected = copy_selection()
 
         if not selected.strip():
             current_lang = get_current_lang()
@@ -177,27 +145,44 @@ def on_hotkey():
 
         pyperclip.copy(converted)
         sleep_short(0.04)
-        keyboard.send("ctrl+v")
+        with kb.pressed(pynput_kb.Key.ctrl):
+            kb.press('v')
+            kb.release('v')
         sleep_short(0.06)
 
         switch_keyboard_layout("en" if original_lang == "ru" else "ru")
 
 
-def load_config():
-    config = configparser.ConfigParser()
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
-    config.read(config_path, encoding="utf-8")
-    return config.get("settings", "hotkey", fallback="F16")
+def to_pynput_hotkey(hotkey_str: str) -> str:
+    """Convert 'F16' or 'ctrl+shift+f' to pynput GlobalHotKeys format."""
+    key_names = {k.name for k in pynput_kb.Key}
+    parts = hotkey_str.lower().strip().split('+')
+    result = []
+    for part in parts:
+        part = part.strip()
+        if part in key_names:
+            result.append(f'<{part}>')
+        else:
+            result.append(part)
+    return '+'.join(result)
+
+
+def get_resource_path(filename: str) -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
 
 
 def create_tray_image() -> Image.Image:
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
-    return Image.open(icon_path)
+    return Image.open(get_resource_path("icon.png"))
 
 
 def run_tray(hotkey: str) -> None:
     def on_exit(icon, item):
-        keyboard.unhook_all()
+        if hotkey_listener:
+            hotkey_listener.stop()
         icon.stop()
 
     menu = pystray.Menu(
@@ -210,13 +195,23 @@ def run_tray(hotkey: str) -> None:
 
 
 def main():
+    global hotkey_listener
+
     hotkey = load_config()
+    pynput_key = to_pynput_hotkey(hotkey)
     print("EN<->RU layout converter running.")
-    print(f"Hotkey: {hotkey}")
+    print(f"Hotkey: {hotkey} ({pynput_key})")
     print("Right-click tray icon to exit.\n")
 
-    keyboard.add_hotkey(hotkey, on_hotkey, suppress=True)
+    hotkey_listener = pynput_kb.GlobalHotKeys({pynput_key: on_hotkey})
+    hotkey_listener.start()
     run_tray(hotkey)
+
+
+def load_config():
+    config = configparser.ConfigParser()
+    config.read(get_resource_path("config.ini"), encoding="utf-8")
+    return config.get("settings", "hotkey", fallback="F16")
 
 
 if __name__ == "__main__":
